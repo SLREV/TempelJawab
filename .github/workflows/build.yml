@@ -19,6 +19,11 @@ jobs:
         uses: gradle/actions/setup-gradle@v3
         with:
           gradle-version: 8.5
+      - name: Fix XML Headers
+        run: |
+          sed -i 's|<manifest.*|<manifest xmlns:android="http://android.com">|g' app/src/main/AndroidManifest.xml
+          sed -i 's|<LinearLayout xmlns:android=.*|<LinearLayout xmlns:android="http://android.com"|g' app/src/main/res/layout/activity_main.xml
+          sed -i 's|<LinearLayout xmlns:android=.*|<LinearLayout xmlns:android="http://android.com"|g' app/src/main/res/layout/layout_bubble.xml
       - name: Build Debug APK
         run: gradle assembleDebug
       - name: Upload APK
