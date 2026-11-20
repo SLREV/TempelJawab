@@ -7,6 +7,7 @@ import android.content.Intent
 import android.graphics.Bitmap
 import android.graphics.PixelFormat
 import android.hardware.display.DisplayManager
+import android.hardware.display.VirtualDisplay
 import android.media.ImageReader
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
@@ -15,6 +16,7 @@ import android.os.Build
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import android.util.Log
 import android.view.*
 import android.webkit.*
 import android.widget.Button
@@ -32,7 +34,13 @@ class FloatingBubbleService : Service() {
 
     private var mediaProjection: MediaProjection? = null
     private var imageReader: ImageReader? = null
-    private var fileUploadCallback: ValueCallback<Array<Uri>>? = null
+    private var virtualDisplay: VirtualDisplay? = null
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private val projectionCallback = object : MediaProjection.Callback() {
+        override fun onStop() {
+            stopSelf()
+        }
+    }
     private var fileGambarTerakhir: Uri? = null
 
     private lateinit var webView: WebView
@@ -43,7 +51,11 @@ class FloatingBubbleService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         mulaiNotifikasiForeground()
 
-        val resultCode = intent?.getIntExtra("RESULT_CODE", Activity.RESULT_CANCELED) ?: return START_NOT_STICKY
+        if (mediaProjection != null) return START_NOT_STICKY
+        if (intent == null || intent.getIntExtra("RESULT_CODE", Activity.RESULT_CANCELED) != Activity.RESULT_OK) {
+            stopSelf()
+            return START_NOT_STICKY
+        }
         val data: Intent? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             intent.getParcelableExtra("DATA", Intent::class.java)
         } else {
@@ -51,10 +63,23 @@ class FloatingBubbleService : Service() {
             intent.getParcelableExtra("DATA")
         }
 
-        if (data != null) {
+        if (data == null) {
+            stopSelf()
+            return START_NOT_STICKY
+        }
+
+        try {
             val projectionManager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
-            mediaProjection = projectionManager.getMediaProjection(resultCode, data)
-            siapkanPerekamLayar()
+            val projection = checkNotNull(projectionManager.getMediaProjection(Activity.RESULT_OK, data))
+            mediaProjection = projection
+            projection.registerCallback(projectionCallback, mainHandler)
+            siapkanPerekamLayar(projection)
+        } catch (e: SecurityException) {
+            Log.w("FloatingBubbleService", "Izin perekaman layar tidak berlaku", e)
+            stopSelf()
+        } catch (e: IllegalStateException) {
+            Log.w("FloatingBubbleService", "Sesi perekaman layar tidak tersedia", e)
+            stopSelf()
         }
 
         return START_NOT_STICKY
@@ -134,12 +159,9 @@ class FloatingBubbleService : Service() {
                 filePathCallback: ValueCallback<Array<Uri>>?,
                 fileChooserParams: FileChooserParams?
             ): Boolean {
-                if (fileGambarTerakhir != null) {
-                    filePathCallback?.onReceiveValue(arrayOf(fileGambarTerakhir!!))
-                    fileGambarTerakhir = null
-                    return true
-                }
-                fileUploadCallback = filePathCallback
+                val gambar = fileGambarTerakhir
+                fileGambarTerakhir = null
+                filePathCallback?.onReceiveValue(gambar?.let { arrayOf(it) })
                 return true
             }
         }
@@ -147,10 +169,10 @@ class FloatingBubbleService : Service() {
         webView.loadUrl("https://google.com")
     }
 
-    private fun siapkanPerekamLayar() {
+    private fun siapkanPerekamLayar(projection: MediaProjection) {
         val metrics = resources.displayMetrics
         imageReader = ImageReader.newInstance(metrics.widthPixels, metrics.heightPixels, PixelFormat.RGBA_8888, 2)
-        mediaProjection?.createVirtualDisplay(
+        virtualDisplay = projection.createVirtualDisplay(
             "ScreenCapture",
             metrics.widthPixels,
             metrics.heightPixels,
@@ -164,26 +186,20 @@ class FloatingBubbleService : Service() {
 
     private fun jepretDanKirim(posX: Int, posY: Int) {
         val image = imageReader?.acquireLatestImage() ?: return
-        val planes = image.planes
-        val buffer = planes[0].buffer
-        val pixelStride = planes[0].pixelStride
-        val rowStride = planes[0].rowStride
-        val rowPadding = rowStride - pixelStride * image.width
+        val croppedBitmap = image.use {
+            val plane = it.planes[0]
+            val paddedWidth = plane.rowStride / plane.pixelStride
+            val fullBitmap = Bitmap.createBitmap(paddedWidth, it.height, Bitmap.Config.ARGB_8888)
+            fullBitmap.copyPixelsFromBuffer(plane.buffer)
 
-        val fullBitmap = Bitmap.createBitmap(
-            image.width + rowPadding / pixelStride,
-            image.height,
-            Bitmap.Config.ARGB_8888
-        )
-        fullBitmap.copyPixelsFromBuffer(buffer)
-        image.close()
-
-        val cropX = (posX - 150).coerceIn(0, fullBitmap.width - 100)
-        val cropY = (posY - 100).coerceIn(0, fullBitmap.height - 100)
-        val cropW = 600.coerceAtMost(fullBitmap.width - cropX)
-        val cropH = 400.coerceAtMost(fullBitmap.height - cropY)
-
-        val croppedBitmap = Bitmap.createBitmap(fullBitmap, cropX, cropY, cropW, cropH)
+            val cropX = (posX - 150).coerceIn(0, (it.width - 100).coerceAtLeast(0))
+            val cropY = (posY - 100).coerceIn(0, (it.height - 100).coerceAtLeast(0))
+            val cropW = minOf(600, it.width - cropX)
+            val cropH = minOf(400, it.height - cropY)
+            Bitmap.createBitmap(fullBitmap, cropX, cropY, cropW, cropH).also { crop ->
+                if (crop !== fullBitmap) fullBitmap.recycle()
+            }
+        }
 
         val file = File(cacheDir, "soal_scan.jpg")
         FileOutputStream(file).use { out ->
@@ -193,7 +209,7 @@ class FloatingBubbleService : Service() {
 
         kotakJawaban.visibility = View.VISIBLE
 
-        Handler(Looper.getMainLooper()).postDelayed({
+        mainHandler.postDelayed({
             val jsOtomatis = """
                 (function() {
                     var inputFile = document.querySelector('input[type="file"]');
@@ -207,7 +223,7 @@ class FloatingBubbleService : Service() {
     private fun mulaiNotifikasiForeground() {
         val channelId = "tempel_jawab_channel"
         val channel = NotificationChannel(channelId, "Tempel Jawab Service", NotificationManager.IMPORTANCE_LOW)
-        getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
+        (getSystemService(NOTIFICATION_SERVICE) as NotificationManager).createNotificationChannel(channel)
 
         val notification = NotificationCompat.Builder(this, channelId)
             .setContentTitle("Tempel Jawab Aktif")
@@ -219,8 +235,12 @@ class FloatingBubbleService : Service() {
     }
 
     override fun onDestroy() {
-        super.onDestroy()
+        mainHandler.removeCallbacksAndMessages(null)
+        virtualDisplay?.release()
+        imageReader?.close()
+        mediaProjection?.unregisterCallback(projectionCallback)
         if (::floatingView.isInitialized) windowManager.removeView(floatingView)
         mediaProjection?.stop()
+        super.onDestroy()
     }
 }
